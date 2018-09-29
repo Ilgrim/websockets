@@ -76,7 +76,7 @@ class WebSocketCommonProtocol(asyncio.StreamReaderProtocol):
             await process(message)
 
     The iterator yields incoming messages. It exits normally when the
-    connection is closed with the status code 1000 (OK) or 1001 (going away).
+    connection is closed with the close code 1000 (OK) or 1001 (going away).
     It raises a :exc:`~websockets.exceptions.ConnectionClosed` exception when
     the connection is closed with any other status code.
 
@@ -352,9 +352,10 @@ class WebSocketCommonProtocol(asyncio.StreamReaderProtocol):
         """
         return self.state is State.CLOSED
 
+    @asyncio.coroutine
     def wait_closed(self):
         """
-        Return a :class:`asyncio.Future` that completes when the connection is closed.
+        Wait until the connection is closed.
 
         This is identical to :attr:`closed`, except it can be awaited.
 
@@ -362,7 +363,7 @@ class WebSocketCommonProtocol(asyncio.StreamReaderProtocol):
         of its cause, in tasks that interact with the WebSocket connection.
 
         """
-        return asyncio.shield(self.connection_lost_waiter)
+        yield from asyncio.shield(self.connection_lost_waiter)
 
     @asyncio.coroutine
     def recv(self):
@@ -941,9 +942,9 @@ class WebSocketCommonProtocol(asyncio.StreamReaderProtocol):
 
                 # ping() cannot raise ConnectionClosed, only CancelledError:
                 # - If the connection is CLOSING, keepalive_ping_task will be
-                #   cancelled by close_connection() before ping() returns.
+                #   canceled by close_connection() before ping() returns.
                 # - If the connection is CLOSED, keepalive_ping_task must be
-                #   cancelled already.
+                #   canceled already.
                 ping_waiter = yield from self.ping()
 
                 if self.ping_timeout is not None:

@@ -97,7 +97,8 @@ class WebSocketServerProtocol(WebSocketCommonProtocol):
         Handle the lifecycle of a WebSocket connection.
 
         Since this method doesn't have a caller able to handle exceptions, it
-        attemps to log relevant ones and close the connection properly.
+        attemps to log relevant ones and guarantees that the TCP connection is
+        closed before exiting.
 
         """
         try:
@@ -113,13 +114,7 @@ class WebSocketServerProtocol(WebSocketCommonProtocol):
                 logger.debug("Connection error in opening handshake", exc_info=True)
                 raise
             except Exception as exc:
-                if self._is_server_shutting_down(exc):
-                    status, headers, body = (
-                        SERVICE_UNAVAILABLE,
-                        [],
-                        b"Server is shutting down.\n",
-                    )
-                elif isinstance(exc, AbortHandshake):
+                if isinstance(exc, AbortHandshake):
                     status, headers, body = exc.status, exc.headers, exc.body
                 elif isinstance(exc, InvalidOrigin):
                     logger.debug("Invalid origin", exc_info=True)
@@ -163,13 +158,9 @@ class WebSocketServerProtocol(WebSocketCommonProtocol):
             try:
                 yield from self.ws_handler(self, path)
             except Exception as exc:
-                if self._is_server_shutting_down(exc):
-                    if not self.closed:
-                        self.fail_connection(1001)
-                else:
-                    logger.error("Error in connection handler", exc_info=True)
-                    if not self.closed:
-                        self.fail_connection(1011)
+                logger.error("Error in connection handler", exc_info=True)
+                if not self.closed:
+                    self.fail_connection(1011)
                 raise
 
             try:
@@ -178,8 +169,7 @@ class WebSocketServerProtocol(WebSocketCommonProtocol):
                 logger.debug("Connection error in closing handshake", exc_info=True)
                 raise
             except Exception as exc:
-                if not self._is_server_shutting_down(exc):
-                    logger.warning("Error in closing handshake", exc_info=True)
+                logger.warning("Error in closing handshake", exc_info=True)
                 raise
 
         except Exception:
@@ -195,13 +185,6 @@ class WebSocketServerProtocol(WebSocketCommonProtocol):
             # task because the server waits for tasks attached to registered
             # connections before terminating.
             self.ws_server.unregister(self)
-
-    def _is_server_shutting_down(self, exc):
-        """
-        Decide whether an exception means that the server is shutting down.
-
-        """
-        return isinstance(exc, asyncio.CancelledError) and self.ws_server.closing
 
     @asyncio.coroutine
     def read_http_request(self):
@@ -538,8 +521,14 @@ class WebSocketServer:
         # Store a reference to loop to avoid relying on self.server._loop.
         self.loop = loop
 
-        self.closing = False
+        # Keep track of active connections.
         self.websockets = set()
+
+        # Task responsible for closing the server and terminating connections.
+        self.close_task = None
+
+        # Completed when the server is closed and connections are terminated.
+        self.closed_waiter = asyncio.Future(loop=loop)
 
     def wrap(self, server):
         """
@@ -574,53 +563,65 @@ class WebSocketServer:
 
     def close(self):
         """
-        Close the underlying server, and clean up connections.
+        Close the server and terminate connections.
 
-        This calls :meth:`~asyncio.Server.close` on the underlying
-        :class:`~asyncio.Server` object, closes open connections with
-        status code 1001, and stops accepting new connections.
+        This method is idempotent.
 
         """
-        # Make a note that the server is shutting down. Websocket connections
-        # check this attribute to decide to send a "going away" close code.
-        self.closing = True
+        if self.close_task is None:
+            self.close_task = asyncio_ensure_future(self._close(), loop=self.loop)
 
+    @asyncio.coroutine
+    def _close(self):
+        """
+        Implementation of :meth:`close`.
+
+        This calls :meth:`~asyncio.Server.close` on the underlying
+        :class:`~asyncio.Server` object to stop accepting new connections and
+        then closes open connections with close code 1001.
+
+        """
         # Stop accepting new connections.
         self.server.close()
 
-        # Close open connections. For each connection, two tasks are running:
-        # 1. self.transfer_data_task receives incoming WebSocket messages
-        # 2. self.handler_task runs the opening handshake, the handler provided
-        #    by the user and the closing handshake
-        # In the general case, cancelling the handler task will cause the
-        # handler provided by the user to exit with a CancelledError, which
-        # will then cause the transfer data task to terminate.
+        # Wait until self.server.close() completes.
+        yield from self.server.wait_closed()
+
+        # Wait until all accepted connections reach connection_made() and call
+        # register(). See https://bugs.python.org/issue34852 for details.
+        yield from asyncio.sleep(0)
+
+        # Close open connections. fail_connection() will cancel the transfer
+        # data task, which is expected to cause the handler task to terminate.
         for websocket in self.websockets:
-            websocket.handler_task.cancel()
+            websocket.fail_connection(1001)
 
-    @asyncio.coroutine
-    def wait_closed(self):
-        """
-        Wait until the underlying server and all connections are closed.
-
-        This calls :meth:`~asyncio.Server.wait_closed` on the underlying
-        :class:`~asyncio.Server` object and waits until closing handshakes
-        are complete and all connections are closed.
-
-        This method must be called after :meth:`close()`.
-
-        """
         # asyncio.wait doesn't accept an empty first argument.
         if self.websockets:
-            # Either the handler or the connection can terminate first,
-            # depending on how the client behaves and the server is
-            # implemented.
+            # The connection handler can terminate before or after the
+            # connection closes. Wait until both are done to avoid leaking
+            # running tasks.
+            # TODO: it would be nicer to wait only for the connection handler
+            # and let the handler wait for the connection to close.
             yield from asyncio.wait(
                 [websocket.handler_task for websocket in self.websockets]
                 + [websocket.close_connection_task for websocket in self.websockets],
                 loop=self.loop,
             )
-        yield from self.server.wait_closed()
+
+        # Done!
+        self.closed_waiter.set_result(None)
+
+    @asyncio.coroutine
+    def wait_closed(self):
+        """
+        Wait until the server is closed and all connections are terminated.
+
+        When :meth:`wait_closed()` completes, all TCP connections are closed
+        and there are no pending tasks left.
+
+        """
+        yield from asyncio.shield(self.closed_waiter)
 
     @property
     def sockets(self):
@@ -695,10 +696,11 @@ class Serve:
     performs the closing handshake and closes the connection.
 
     When a server is closed with
-    :meth:`~websockets.server.WebSocketServer.close`, all running WebSocket
-    handlers are canceled. They may intercept :exc:`~asyncio.CancelledError`
-    and perform cleanup actions before re-raising that exception. If a handler
-    started new tasks, it should cancel them as well in that case.
+    :meth:`~websockets.server.WebSocketServer.close`, it closes all
+    connections with close code 1001 (going away). WebSocket handlers — which
+    are running the coroutine passed in the ``ws_handler`` — receive a
+    :exc:`~websockets.exceptions.ConnectionClosed` exception and should
+    terminate quickly.
 
     Since there's no useful way to propagate exceptions triggered in handlers,
     they're sent to the ``'websockets.server'`` logger instead. Debugging is

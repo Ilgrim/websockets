@@ -64,11 +64,7 @@ def handler(ws, path):
     elif path == '/subprotocol':
         yield from ws.send(repr(ws.subprotocol))
     elif path == '/slow_stop':
-        try:
-            yield from asyncio.sleep(1000 * MS)
-        except asyncio.CancelledError:
-            yield from asyncio.sleep(MS)
-            raise
+        yield from asyncio.wait_for(ws.wait_closed(), 1000 * MS)
     else:
         yield from ws.send((yield from ws.recv()))
 
@@ -285,6 +281,8 @@ class ClientServerTests(unittest.TestCase):
         self.loop.run_until_complete(self.client.send("Hello!"))
         reply = self.loop.run_until_complete(self.client.recv())
         self.assertEqual(reply, "Hello!")
+
+    # TODO THIS TEST IS BROKEN!!
 
     def test_server_close_while_client_connected(self):
         with self.temp_server(loop=self.loop):
@@ -922,18 +920,6 @@ class ClientServerTests(unittest.TestCase):
         self.client.writer.close()
         # The server should stop properly anyway. It used to hang because the
         # task handling the connection was waiting for the opening handshake.
-
-    @with_server()
-    @unittest.mock.patch('websockets.server.read_request')
-    def test_server_shuts_down_during_opening_handshake(self, _read_request):
-        _read_request.side_effect = asyncio.CancelledError
-
-        self.server.closing = True
-        with self.assertRaises(InvalidHandshake) as raised:
-            self.start_client()
-
-        # Opening handshake fails with 503 Service Unavailable
-        self.assertEqual(str(raised.exception), "Status code not 101: 503")
 
     @with_server()
     def test_server_shuts_down_during_connection_handling(self):

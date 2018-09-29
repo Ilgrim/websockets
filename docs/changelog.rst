@@ -20,16 +20,28 @@ Changelog
 
 .. warning::
 
+  **Version 7.0 changes how a server terminates connections when it's closed
+  with :meth:`~websockets.server.WebSocketServer.close`.**
+
+  Previously, connections handlers were cancelled. Now, connections are closed
+  with close code 1001 (going away). From the perspective of the connection
+  handler, this is the same as if the remote endpoint was disconnecting. This
+  removes the need to prepare for :exc:`~asyncio.CancelledError` in connection
+  handlers.
+
+.. warning::
+
   **Version 7.0 changes how a** :meth:`~protocol.WebSocketCommonProtocol.ping`
   **that hasn't received a pong yet behaves when the connection is closed.**
 
   The ping — as in ``ping = await websocket.ping()`` — used to be canceled
   when the connection is closed, so that ``await ping`` raised
-  :exc:`~concurrent.futures.CancelledError`. Now ``await ping`` raises
+  :exc:`~asyncio.CancelledError`. Now ``await ping`` raises
   :exc:`~exceptions.ConnectionClosed` like other public APIs.
 
 * websockets sends Ping frames at regular intervals and closes the connection
-  if it doesn't receive a matching Pong frame. See :class:`~protocol.WebSocketCommonProtocol` for details.
+  if it doesn't receive a matching Pong frame. See
+  :class:`~protocol.WebSocketCommonProtocol` for details.
 
 * Added support for sending fragmented messages.
 
@@ -107,7 +119,7 @@ Also:
   credentials.
 
 * Iterating on incoming messages no longer raises an exception when the
-  connection terminates with code 1001 (going away).
+  connection terminates with close code 1001 (going away).
 
 * A plain HTTP request now receives a 426 Upgrade Required response and
   doesn't log a stack trace.
